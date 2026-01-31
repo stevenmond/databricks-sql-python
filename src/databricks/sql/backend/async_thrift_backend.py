@@ -941,3 +941,7 @@ class AsyncThriftDatabricksClient(AsyncDatabricksClient):
             ssl_options=self._ssl_options,
             has_more_rows=has_more_rows,
         )
+
+    async def close(self) -> None:
+        """Close the async Thrift transport."""
+        await self._transport.close()

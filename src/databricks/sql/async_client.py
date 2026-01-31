@@ -259,14 +259,14 @@ class AsyncConnection:
         self.use_inline_params = kwargs.get("use_inline_params", False)
 
     async def __aenter__(self) -> "AsyncConnection":
-        await self.open()
+        await self._open()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
-    async def open(self) -> None:
-        """Open the async connection."""
+    async def _open(self) -> None:
+        """Open the async connection (internal method)."""
         if self._is_open:
             return
 
@@ -340,6 +340,13 @@ class AsyncConnection:
                 session_id_hex=self.get_session_id_hex(),
             )
 
+        if self.session is None or self.session.backend is None:
+            raise InterfaceError(
+                "Session or backend not initialized",
+                host_url=self._server_hostname,
+                session_id_hex=self.get_session_id_hex(),
+            )
+
         cursor = AsyncCursor(
             connection=self,
             backend=self.session.backend,
@@ -407,6 +414,15 @@ class AsyncCursor:
                 session_id_hex=self.connection.get_session_id_hex(),
             )
 
+    def _get_session_id(self) -> SessionId:
+        """Get the session ID, raising an error if not available."""
+        if self.connection.session is None:
+            raise InterfaceError(
+                "Session not initialized",
+                host_url=self.connection._server_hostname,
+            )
+        return self._get_session_id()
+
     async def _close_and_clear_active_result_set(self):
         try:
             if self.active_result_set:
@@ -424,6 +440,25 @@ class AsyncCursor:
             return ParameterApproach.INLINE
         return ParameterApproach.NATIVE
 
+    def _normalize_tparametersequence(
+        self, params: TParameterSequence
+    ) -> List[TDbsqlParameter]:
+        """Normalize a sequence of parameters, retaining order."""
+        output: List[TDbsqlParameter] = []
+        for p in params:
+            if isinstance(p, DbsqlParameterBase):
+                output.append(p)  # type: ignore[arg-type]
+            else:
+                output.append(dbsql_parameter_from_primitive(value=p))
+        return output
+
+    def _normalize_tparameterdict(self, params: TParameterDict) -> List[TDbsqlParameter]:
+        """Normalize a dictionary of parameters."""
+        return [
+            dbsql_parameter_from_primitive(value=value, name=name)
+            for name, value in params.items()
+        ]
+
     def _normalize_tparametercollection(
         self, params: Optional[TParameterCollection]
     ) -> List[TDbsqlParameter]:
@@ -431,18 +466,9 @@ class AsyncCursor:
         if params is None:
             return []
         if isinstance(params, dict):
-            return [
-                dbsql_parameter_from_primitive(value=value, name=name)
-                for name, value in params.items()
-            ]
+            return self._normalize_tparameterdict(params)  # type: ignore[arg-type]
         if isinstance(params, Sequence):
-            output: List[TDbsqlParameter] = []
-            for p in params:
-                if isinstance(p, DbsqlParameterBase):
-                    output.append(p)
-                else:
-                    output.append(dbsql_parameter_from_primitive(value=p))
-            return output
+            return self._normalize_tparametersequence(list(params))
         return []
 
     def _all_dbsql_parameters_are_named(self, params: List[TDbsqlParameter]) -> bool:
@@ -522,7 +548,7 @@ class AsyncCursor:
 
         self.active_result_set = await self.backend.execute_command(
             operation=prepared_operation,
-            session_id=self.connection.session.session_id,
+            session_id=self._get_session_id(),
             max_rows=self.arraysize,
             max_bytes=self.buffer_size_bytes,
             lz4_compression=self.connection.lz4_compression,
@@ -579,7 +605,7 @@ class AsyncCursor:
 
         await self.backend.execute_command(
             operation=prepared_operation,
-            session_id=self.connection.session.session_id,
+            session_id=self._get_session_id(),
             max_rows=self.arraysize,
             max_bytes=self.buffer_size_bytes,
             lz4_compression=self.connection.lz4_compression,
@@ -633,6 +659,8 @@ class AsyncCursor:
 
         operation_state = await self.get_query_state()
         if operation_state == CommandState.SUCCEEDED:
+            if self.active_command_id is None:
+                raise Error("No active command to get results for")
             self.active_result_set = await self.backend.get_execution_result(
                 self.active_command_id, self
             )
@@ -762,7 +790,7 @@ class AsyncCursor:
         self._check_not_closed()
         await self._close_and_clear_active_result_set()
         self.active_result_set = await self.backend.get_catalogs(
-            session_id=self.connection.session.session_id,
+            session_id=self._get_session_id(),
             max_rows=self.arraysize,
             max_bytes=self.buffer_size_bytes,
             cursor=self,
@@ -776,7 +804,7 @@ class AsyncCursor:
         self._check_not_closed()
         await self._close_and_clear_active_result_set()
         self.active_result_set = await self.backend.get_schemas(
-            session_id=self.connection.session.session_id,
+            session_id=self._get_session_id(),
             max_rows=self.arraysize,
             max_bytes=self.buffer_size_bytes,
             cursor=self,
@@ -796,7 +824,7 @@ class AsyncCursor:
         self._check_not_closed()
         await self._close_and_clear_active_result_set()
         self.active_result_set = await self.backend.get_tables(
-            session_id=self.connection.session.session_id,
+            session_id=self._get_session_id(),
             max_rows=self.arraysize,
             max_bytes=self.buffer_size_bytes,
             cursor=self,
@@ -818,7 +846,7 @@ class AsyncCursor:
         self._check_not_closed()
         await self._close_and_clear_active_result_set()
         self.active_result_set = await self.backend.get_columns(
-            session_id=self.connection.session.session_id,
+            session_id=self._get_session_id(),
             max_rows=self.arraysize,
             max_bytes=self.buffer_size_bytes,
             cursor=self,
@@ -903,5 +931,5 @@ async def async_connect(
         schema=schema,
         **kwargs,
     )
-    await connection.open()
+    await connection._open()
     return connection

@@ -352,3 +352,13 @@ class AsyncDatabricksClient(ABC):
             int: The maximum number of download threads
         """
         pass
+
+    async def close(self) -> None:
+        """
+        Close the client and release any resources.
+
+        This method should be called when the client is no longer needed.
+        The default implementation does nothing, but subclasses may override
+        to clean up resources like HTTP connections.
+        """
+        pass
