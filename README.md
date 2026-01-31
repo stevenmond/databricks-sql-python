@@ -30,6 +30,12 @@ Install using `pip install databricks-sql-connector`
 ### Installing the core library with PyArrow
 Install using `pip install databricks-sql-connector[pyarrow]`
 
+### Installing with async support
+Install using `pip install databricks-sql-connector[async]`
+
+### Installing with all optional dependencies
+Install using `pip install databricks-sql-connector[all]`
+
 
 ```bash
 export DATABRICKS_HOST=********.databricks.com
@@ -63,9 +69,60 @@ In the above example:
 - `http-path` is the HTTP Path either to a Databricks SQL endpoint (e.g. /sql/1.0/endpoints/1234567890abcdef),
 or to a Databricks Runtime interactive cluster (e.g. /sql/protocolv1/o/1234567890123456/1234-123456-slid123)
 
-> Note: This example uses [Databricks OAuth U2M](https://docs.databricks.com/en/dev-tools/auth/oauth-u2m.html) 
-> to authenticate the target Databricks user account and needs to open the browser for authentication. So it 
+> Note: This example uses [Databricks OAuth U2M](https://docs.databricks.com/en/dev-tools/auth/oauth-u2m.html)
+> to authenticate the target Databricks user account and needs to open the browser for authentication. So it
 > can only run on the user's machine.
+
+## Async Support
+
+The connector provides true async/await support for non-blocking database operations. This is useful for high-concurrency applications and async frameworks like FastAPI, aiohttp, etc.
+
+### Installation
+
+```bash
+pip install databricks-sql-connector[async]
+```
+
+### Async Example
+
+```python
+import asyncio
+from databricks import sql
+
+async def main():
+    # async_connect returns an open connection
+    async with await sql.async_connect(
+        server_hostname=os.getenv("DATABRICKS_HOST"),
+        http_path=os.getenv("DATABRICKS_HTTP_PATH"),
+        access_token=os.getenv("DATABRICKS_TOKEN"),
+    ) as connection:
+        async with connection.cursor() as cursor:
+            # Execute query asynchronously
+            await cursor.execute("SELECT * FROM my_table LIMIT 100")
+
+            # Fetch results asynchronously
+            rows = await cursor.fetchall()
+            for row in rows:
+                print(row)
+
+            # Async iteration over results
+            await cursor.execute("SELECT * FROM large_table")
+            async for row in cursor:
+                process(row)
+
+asyncio.run(main())
+```
+
+### Key Features
+
+- **True async I/O**: Uses `aiohttp` for non-blocking HTTP operations
+- **Non-blocking polling**: Uses `asyncio.sleep()` instead of blocking `time.sleep()`
+- **Full API support**: Async versions of `execute()`, `fetchone()`, `fetchmany()`, `fetchall()`, `fetchall_arrow()`
+- **Context manager support**: `async with` for connections and cursors
+- **Async iteration**: `async for row in cursor`
+- **Backward compatible**: Existing sync API unchanged
+
+> Note: Async support currently works with SEA (Statement Execution API) backend, which is used for SQL warehouses.
 
 ## Transaction Support
 

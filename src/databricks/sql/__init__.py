@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     # Use this import purely for type annotations, a la https://mypy.readthedocs.io/en/latest/runtime_troubles.html#import-cycles
     from .client import Connection
+    from .async_client import AsyncConnection
 
 
 class RedactUrlQueryParamsFilter(logging.Filter):
@@ -91,3 +92,35 @@ def connect(server_hostname, http_path, access_token=None, **kwargs) -> "Connect
     from .client import Connection
 
     return Connection(server_hostname, http_path, access_token, **kwargs)
+
+
+async def async_connect(
+    server_hostname, http_path, access_token=None, **kwargs
+) -> "AsyncConnection":
+    """
+    Create and open an async connection to Databricks SQL endpoint.
+
+    This is the main entry point for async connections. It creates an AsyncConnection
+    and opens it, returning a ready-to-use connection object.
+
+    Usage:
+        async with await async_connect(...) as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT * FROM table")
+                rows = await cursor.fetchall()
+
+    Args:
+        server_hostname: Databricks instance host name
+        http_path: HTTP path to the SQL endpoint or warehouse
+        access_token: HTTP Bearer access token (e.g., Databricks Personal Access Token)
+        **kwargs: Additional keyword arguments
+
+    Returns:
+        AsyncConnection: An open async connection object
+
+    Requires:
+        aiohttp must be installed: pip install databricks-sql-connector[async]
+    """
+    from .async_client import async_connect as _async_connect
+
+    return await _async_connect(server_hostname, http_path, access_token, **kwargs)
