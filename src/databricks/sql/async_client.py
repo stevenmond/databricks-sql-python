@@ -112,7 +112,6 @@ class AsyncSession:
     async def open(self) -> None:
         """Open the async session."""
         # Create auth provider (sync operation - no network calls typically)
-        # Note: For async, we might need to handle OAuth token refresh differently
         from databricks.sql.auth.authenticators import AuthProvider
 
         # Create a simple auth provider that adds headers
@@ -120,26 +119,41 @@ class AsyncSession:
             self._server_hostname, **self._kwargs
         )
 
-        # Create async backend - only SEA is supported for async
+        # Determine which backend to use
+        # SEA is the default for async, but Thrift is also supported
         use_sea = self._kwargs.get("use_sea", True)  # Default to SEA for async
-        if not use_sea:
-            logger.warning(
-                "Async support currently only works with SEA backend. "
-                "Switching to SEA backend automatically."
+        use_thrift = self._kwargs.get("use_thrift", False)
+
+        if use_thrift or not use_sea:
+            # Use async Thrift backend
+            logger.info("Using async Thrift backend")
+            from databricks.sql.backend.async_thrift_backend import AsyncThriftDatabricksClient
+
+            self.backend = AsyncThriftDatabricksClient(
+                server_hostname=self._server_hostname,
+                port=self.port,
+                http_path=self.http_path,
+                http_headers=self.all_headers,
+                auth_provider=self.auth_provider,
+                ssl_options=self.ssl_options,
+                _use_arrow_native_complex_types=self._use_arrow_native_complex_types,
+                **self._kwargs,
             )
+        else:
+            # Use async SEA backend (default)
+            logger.info("Using async SEA backend")
+            from databricks.sql.backend.sea.async_backend import AsyncSeaDatabricksClient
 
-        from databricks.sql.backend.sea.async_backend import AsyncSeaDatabricksClient
-
-        self.backend = AsyncSeaDatabricksClient(
-            server_hostname=self._server_hostname,
-            port=self.port,
-            http_path=self.http_path,
-            http_headers=self.all_headers,
-            auth_provider=self.auth_provider,
-            ssl_options=self.ssl_options,
-            _use_arrow_native_complex_types=self._use_arrow_native_complex_types,
-            **self._kwargs,
-        )
+            self.backend = AsyncSeaDatabricksClient(
+                server_hostname=self._server_hostname,
+                port=self.port,
+                http_path=self.http_path,
+                http_headers=self.all_headers,
+                auth_provider=self.auth_provider,
+                ssl_options=self.ssl_options,
+                _use_arrow_native_complex_types=self._use_arrow_native_complex_types,
+                **self._kwargs,
+            )
 
         self._session_id = await self.backend.open_session(
             session_configuration=self.session_configuration,
