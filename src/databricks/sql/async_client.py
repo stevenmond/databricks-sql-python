@@ -435,7 +435,7 @@ class AsyncCursor:
                 "Session not initialized",
                 host_url=self.connection._server_hostname,
             )
-        return self._get_session_id()
+        return self.connection.session.session_id
 
     async def _close_and_clear_active_result_set(self):
         try:
