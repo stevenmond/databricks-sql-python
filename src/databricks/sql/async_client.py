@@ -30,6 +30,7 @@ from databricks.sql.backend.async_result_set import AsyncResultSet
 from databricks.sql.backend.types import CommandId, CommandState, SessionId
 from databricks.sql.types import Row, SSLOptions
 from databricks.sql.auth.auth import get_python_sql_connector_auth_provider
+from databricks.sql.common.unified_http_client import UnifiedHttpClient
 from databricks.sql.parameters.native import (
     DbsqlParameterBase,
     TDbsqlParameter,
@@ -44,6 +45,7 @@ from databricks.sql.utils import (
     ParamEscaper,
     inject_parameters,
     transform_paramstyle,
+    build_client_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,7 @@ class AsyncSession:
         self,
         server_hostname: str,
         http_path: str,
+        http_client: UnifiedHttpClient,
         http_headers: Optional[List[Tuple[str, str]]] = None,
         session_configuration: Optional[Dict[str, Any]] = None,
         catalog: Optional[str] = None,
@@ -80,10 +83,13 @@ class AsyncSession:
         self.catalog = catalog
         self.schema = schema
         self.http_path = http_path
+        self.http_client = http_client
         self._autocommit = True
         self._session_id: Optional[SessionId] = None
 
-        user_agent_entry = kwargs.get("user_agent_entry") or kwargs.get("_user_agent_entry")
+        user_agent_entry = kwargs.get("user_agent_entry") or kwargs.get(
+            "_user_agent_entry"
+        )
         if user_agent_entry:
             self.useragent_header = "{}/{} ({})".format(
                 USER_AGENT_NAME, __version__, user_agent_entry
@@ -116,7 +122,7 @@ class AsyncSession:
 
         # Create a simple auth provider that adds headers
         self.auth_provider = get_python_sql_connector_auth_provider(
-            self._server_hostname, **self._kwargs
+            self._server_hostname, http_client=self.http_client, **self._kwargs
         )
 
         # Determine which backend to use
@@ -127,7 +133,9 @@ class AsyncSession:
         if use_thrift or not use_sea:
             # Use async Thrift backend
             logger.info("Using async Thrift backend")
-            from databricks.sql.backend.async_thrift_backend import AsyncThriftDatabricksClient
+            from databricks.sql.backend.async_thrift_backend import (
+                AsyncThriftDatabricksClient,
+            )
 
             self.backend = AsyncThriftDatabricksClient(
                 server_hostname=self._server_hostname,
@@ -142,7 +150,9 @@ class AsyncSession:
         else:
             # Use async SEA backend (default)
             logger.info("Using async SEA backend")
-            from databricks.sql.backend.sea.async_backend import AsyncSeaDatabricksClient
+            from databricks.sql.backend.sea.async_backend import (
+                AsyncSeaDatabricksClient,
+            )
 
             self.backend = AsyncSeaDatabricksClient(
                 server_hostname=self._server_hostname,
@@ -258,6 +268,9 @@ class AsyncConnection:
         self.use_cloud_fetch = kwargs.get("use_cloud_fetch", True)
         self.use_inline_params = kwargs.get("use_inline_params", False)
 
+        client_context = build_client_context(server_hostname, __version__, **kwargs)
+        self.http_client = UnifiedHttpClient(client_context)
+
     async def __aenter__(self) -> "AsyncConnection":
         await self._open()
         return self
@@ -273,6 +286,7 @@ class AsyncConnection:
         self.session = AsyncSession(
             server_hostname=self._server_hostname,
             http_path=self._http_path,
+            http_client=self.http_client,
             http_headers=self._http_headers,
             session_configuration=self._session_configuration,
             catalog=self._catalog,
@@ -452,7 +466,9 @@ class AsyncCursor:
                 output.append(dbsql_parameter_from_primitive(value=p))
         return output
 
-    def _normalize_tparameterdict(self, params: TParameterDict) -> List[TDbsqlParameter]:
+    def _normalize_tparameterdict(
+        self, params: TParameterDict
+    ) -> List[TDbsqlParameter]:
         """Normalize a dictionary of parameters."""
         return [
             dbsql_parameter_from_primitive(value=value, name=name)
