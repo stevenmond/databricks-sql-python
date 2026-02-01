@@ -64,17 +64,27 @@ class AsyncSeaResultSet(AsyncResultSet):
             raise ValueError("Command ID is not a SEA statement ID")
 
         # Build results queue using the sync factory (queue operations are sync)
-        # For async, we may need to handle this differently for cloud fetch
+        # For cloud fetch, we use the sync http_client from the session.
+        # Note: We pass sea_client=None because the LinkFetcher in SeaCloudFetchQueue
+        # uses threading and sync methods, but AsyncSeaDatabricksClient has async methods.
+        # This means only the initial batch of external links will be processed for cloud fetch.
+        # For true async cloud fetch with pagination, we would need an async queue factory.
+        http_client = None
+        ssl_options = None
+        if hasattr(connection, 'session') and connection.session is not None:
+            ssl_options = connection.session.ssl_options
+            http_client = connection.session.http_client
+
         results_queue = SeaResultSetQueueFactory.build_queue(
             result_data,
             self.manifest,
             statement_id,
-            ssl_options=connection.session.ssl_options if hasattr(connection, 'session') else None,
+            ssl_options=ssl_options,
             description=execute_response.description,
             max_download_threads=sea_client.max_download_threads,
-            sea_client=sea_client,
+            sea_client=None,  # Pass None - async client not compatible with sync LinkFetcher
             lz4_compressed=execute_response.lz4_compressed,
-            http_client=None,  # Async doesn't use sync http client
+            http_client=http_client,
         )
 
         # Call parent constructor with common attributes

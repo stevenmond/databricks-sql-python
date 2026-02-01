@@ -86,6 +86,13 @@ class AsyncThriftDatabricksClient(AsyncDatabricksClient):
     CLOSED_OP_STATE = CommandState.CLOSED
     ERROR_OP_STATE = CommandState.FAILED
 
+    # Retry policy attributes (set by _initialize_retry_args)
+    _retry_delay_min: float
+    _retry_delay_max: float
+    _retry_stop_after_attempts_count: int
+    _retry_stop_after_attempts_duration: float
+    _retry_delay_default: float
+
     def __init__(
         self,
         server_hostname: str,
@@ -116,8 +123,10 @@ class AsyncThriftDatabricksClient(AsyncDatabricksClient):
         )
 
         port = port or 443
-        if kwargs.get("_connection_uri"):
-            uri = kwargs.get("_connection_uri")
+        uri: str
+        connection_uri = kwargs.get("_connection_uri")
+        if connection_uri:
+            uri = str(connection_uri)
         elif server_hostname and http_path:
             uri = f"https://{server_hostname.rstrip('/')}:{port}/{http_path.lstrip('/')}"
         else:
@@ -549,6 +558,93 @@ class AsyncThriftDatabricksClient(AsyncDatabricksClient):
 
         return state
 
+    async def get_execution_result(
+        self,
+        command_id: CommandId,
+        cursor: "AsyncCursor",
+    ) -> "AsyncResultSet":
+        """
+        Get the result of a previously executed command asynchronously.
+
+        Args:
+            command_id: The command ID to get results for
+            cursor: The async cursor for the operation
+
+        Returns:
+            AsyncResultSet with the query results
+        """
+        thrift_handle = command_id.to_thrift_handle()
+        if not thrift_handle:
+            raise ValueError("Not a valid Thrift command ID")
+
+        # Fetch results using TFetchResultsReq
+        req = ttypes.TFetchResultsReq(
+            operationHandle=thrift_handle,
+            maxRows=cursor.arraysize,
+            maxBytes=cursor.buffer_size_bytes,
+            orientation=ttypes.TFetchOrientation.FETCH_NEXT,
+        )
+
+        resp = await self._make_request_async(self._client.FetchResults, req)
+
+        # Get metadata for the operation
+        metadata_req = ttypes.TGetResultSetMetadataReq(operationHandle=thrift_handle)
+        metadata_resp = await self._make_request_async(
+            self._client.GetResultSetMetadata, metadata_req
+        )
+
+        # Get the operation state
+        poll_resp = await self._poll_for_status_async(thrift_handle)
+        operation_state = poll_resp.operationState
+
+        if pyarrow:
+            schema_bytes = (
+                metadata_resp.arrowSchema
+                or self._hive_schema_to_arrow_schema(
+                    metadata_resp.schema, self._host
+                )
+                .serialize()
+                .to_pybytes()
+            )
+        else:
+            schema_bytes = None
+
+        description = self._hive_schema_to_description(
+            metadata_resp.schema,
+            schema_bytes,
+            self._host,
+        )
+
+        status = CommandState.from_thrift_state(operation_state)
+        if status is None:
+            raise ValueError(f"Unknown command state: {operation_state}")
+
+        execute_response = ExecuteResponse(
+            command_id=command_id,
+            status=status,
+            description=description,
+            has_been_closed_server_side=False,
+            lz4_compressed=metadata_resp.lz4Compressed,
+            is_staging_operation=metadata_resp.isStagingOperation,
+            arrow_schema_bytes=schema_bytes,
+            result_format=metadata_resp.resultFormat,
+        )
+
+        from databricks.sql.backend.async_thrift_result_set import AsyncThriftResultSet
+
+        return AsyncThriftResultSet(
+            connection=cursor.connection,
+            execute_response=execute_response,
+            thrift_client=self,
+            buffer_size_bytes=cursor.buffer_size_bytes,
+            arraysize=cursor.arraysize,
+            use_cloud_fetch=cursor.connection.use_cloud_fetch,
+            t_row_set=resp.results,
+            max_download_threads=self.max_download_threads,
+            ssl_options=self._ssl_options,
+            has_more_rows=resp.hasMoreRows,
+        )
+
     @staticmethod
     def _hive_schema_to_description(t_table_schema, schema_bytes=None, host_url=None):
         """Convert Hive schema to description tuples."""
@@ -658,10 +754,11 @@ class AsyncThriftDatabricksClient(AsyncDatabricksClient):
         max_bytes: int,
         lz4_compression: bool,
         cursor: "AsyncCursor",
-        use_cloud_fetch: bool = True,
-        parameters: List = None,
-        async_op: bool = False,
-        enforce_embedded_schema_correctness: bool = False,
+        use_cloud_fetch: bool,
+        parameters: List[ttypes.TSparkParameter],
+        async_op: bool,
+        enforce_embedded_schema_correctness: bool,
+        row_limit: Optional[int] = None,
     ) -> Union["AsyncResultSet", None]:
         """
         Execute a SQL command asynchronously.

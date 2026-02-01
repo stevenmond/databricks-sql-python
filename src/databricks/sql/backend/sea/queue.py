@@ -45,10 +45,10 @@ class SeaResultSetQueueFactory(ABC):
         result_data: ResultData,
         manifest: ResultManifest,
         statement_id: str,
-        ssl_options: SSLOptions,
+        ssl_options: Optional[SSLOptions],
         description: List[Tuple],
         max_download_threads: int,
-        sea_client: SeaDatabricksClient,
+        sea_client: Optional[SeaDatabricksClient],
         lz4_compressed: bool,
         http_client,
     ) -> ResultSetQueue:
@@ -61,8 +61,10 @@ class SeaResultSetQueueFactory(ABC):
             statement_id (str): Statement ID for the query
             description (List[List[Any]]): Column descriptions
             max_download_threads (int): Maximum number of download threads
-            sea_client (SeaDatabricksClient): SEA client for fetching additional links
+            sea_client (Optional[SeaDatabricksClient]): SEA client for fetching additional links.
+                Can be None for async clients - only initial batch of links will be used.
             lz4_compressed (bool): Whether the data is LZ4 compressed
+            http_client: HTTP client for downloading result files
 
         Returns:
             ResultSetQueue: The appropriate queue for the result data
@@ -307,8 +309,8 @@ class SeaCloudFetchQueue(CloudFetchQueue):
         self,
         result_data: ResultData,
         max_download_threads: int,
-        ssl_options: SSLOptions,
-        sea_client: SeaDatabricksClient,
+        ssl_options: Optional[SSLOptions],
+        sea_client: Optional[SeaDatabricksClient],
         statement_id: str,
         total_chunk_count: int,
         http_client,
@@ -323,7 +325,7 @@ class SeaCloudFetchQueue(CloudFetchQueue):
             schema_bytes: Arrow schema bytes
             max_download_threads: Maximum number of download threads
             ssl_options: SSL options for downloads
-            sea_client: SEA client for fetching additional links
+            sea_client: SEA client for fetching additional links (can be None for async)
             statement_id: Statement ID for the query
             total_chunk_count: Total number of chunks in the result set
             lz4_compressed: Whether the data is LZ4 compressed
@@ -354,8 +356,13 @@ class SeaCloudFetchQueue(CloudFetchQueue):
         # Track the current chunk we're processing
         self._current_chunk_index = 0
 
+        # Store initial link offsets for use when link_fetcher is None
+        self._initial_link_offsets: List[int] = []
+
         self.link_fetcher = None  # for empty responses, we do not need a link fetcher
-        if total_chunk_count > 0:
+        # Only create LinkFetcher if sea_client is provided (sync client)
+        # For async clients, sea_client should be None and only initial links will be used
+        if total_chunk_count > 0 and sea_client is not None:
             self.link_fetcher = LinkFetcher(
                 download_manager=self.download_manager,
                 backend=sea_client,
@@ -364,26 +371,46 @@ class SeaCloudFetchQueue(CloudFetchQueue):
                 total_chunk_count=total_chunk_count,
             )
             self.link_fetcher.start()
+        elif total_chunk_count > 0 and sea_client is None:
+            # For async clients, add initial links directly to download manager
+            # without background fetching of additional links
+            logger.debug(
+                "SeaCloudFetchQueue: No sea_client provided, only initial links will be used"
+            )
+            for link in initial_links:
+                if link.row_count > 0:
+                    self._initial_link_offsets.append(link.row_offset)
+                    self.download_manager.add_link(LinkFetcher._convert_to_thrift_link(link))
 
         # Initialize table and position
         self.table = self._create_next_table()
 
     def _create_next_table(self) -> Union["pyarrow.Table", None]:
         """Create next table by retrieving the logical next downloaded file."""
-        if self.link_fetcher is None:
+        if self.link_fetcher is not None:
+            # Use link fetcher to get chunk link (sync client mode)
+            chunk_link = self.link_fetcher.get_chunk_link(self._current_chunk_index)
+            if chunk_link is None:
+                return None
+
+            row_offset = chunk_link.row_offset
+            # NOTE: link has already been submitted to download manager at this point
+            arrow_table = self._create_table_at_offset(row_offset)
+
+            self._current_chunk_index += 1
+            return arrow_table
+        elif self._initial_link_offsets:
+            # Use initial link offsets (async client mode - no link fetcher)
+            if self._current_chunk_index >= len(self._initial_link_offsets):
+                return None
+
+            row_offset = self._initial_link_offsets[self._current_chunk_index]
+            arrow_table = self._create_table_at_offset(row_offset)
+
+            self._current_chunk_index += 1
+            return arrow_table
+        else:
             return None
-
-        chunk_link = self.link_fetcher.get_chunk_link(self._current_chunk_index)
-        if chunk_link is None:
-            return None
-
-        row_offset = chunk_link.row_offset
-        # NOTE: link has already been submitted to download manager at this point
-        arrow_table = self._create_table_at_offset(row_offset)
-
-        self._current_chunk_index += 1
-
-        return arrow_table
 
     def close(self):
         super().close()
