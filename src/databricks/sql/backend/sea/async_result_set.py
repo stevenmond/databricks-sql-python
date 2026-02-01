@@ -13,6 +13,7 @@ import logging
 
 from databricks.sql.backend.sea.models.base import ResultData, ResultManifest
 from databricks.sql.backend.sea.utils.conversion import SqlTypeConverter
+from databricks.sql.backend.sea.utils.constants import ResultFormat
 
 try:
     import pyarrow
@@ -24,9 +25,12 @@ if TYPE_CHECKING:
     from databricks.sql.backend.sea.async_backend import AsyncSeaDatabricksClient
 
 from databricks.sql.types import Row
-from databricks.sql.backend.sea.queue import JsonQueue, SeaResultSetQueueFactory
+from databricks.sql.backend.sea.queue import JsonQueue
+from databricks.sql.backend.sea.async_queue import AsyncSeaCloudFetchQueue
 from databricks.sql.backend.types import ExecuteResponse
 from databricks.sql.backend.async_result_set import AsyncResultSet
+from databricks.sql.cloudfetch.downloader import ResultSetDownloadHandler
+from databricks.sql.utils import ArrowQueue, create_arrow_table_from_arrow_file
 
 logger = logging.getLogger(__name__)
 
@@ -63,29 +67,42 @@ class AsyncSeaResultSet(AsyncResultSet):
         if statement_id is None:
             raise ValueError("Command ID is not a SEA statement ID")
 
-        # Build results queue using the sync factory (queue operations are sync)
-        # For cloud fetch, we use the sync http_client from the session.
-        # Note: We pass sea_client=None because the LinkFetcher in SeaCloudFetchQueue
-        # uses threading and sync methods, but AsyncSeaDatabricksClient has async methods.
-        # This means only the initial batch of external links will be processed for cloud fetch.
-        # For true async cloud fetch with pagination, we would need an async queue factory.
-        http_client = None
+        # Get SSL options from session
         ssl_options = None
-        if hasattr(connection, 'session') and connection.session is not None:
+        if hasattr(connection, "session") and connection.session is not None:
             ssl_options = connection.session.ssl_options
-            http_client = connection.session.http_client
 
-        results_queue = SeaResultSetQueueFactory.build_queue(
-            result_data,
-            self.manifest,
-            statement_id,
-            ssl_options=ssl_options,
-            description=execute_response.description,
-            max_download_threads=sea_client.max_download_threads,
-            sea_client=None,  # Pass None - async client not compatible with sync LinkFetcher
-            lz4_compressed=execute_response.lz4_compressed,
-            http_client=http_client,
-        )
+        # Determine which queue to use based on result format
+        self._async_cloud_fetch_queue: Optional[AsyncSeaCloudFetchQueue] = None
+        results_queue = None
+
+        if manifest.format == ResultFormat.JSON_ARRAY.value:
+            # INLINE disposition with JSON_ARRAY format - use sync JsonQueue
+            results_queue = JsonQueue(result_data.data)
+        elif manifest.format == ResultFormat.ARROW_STREAM.value:
+            if result_data.attachment is not None:
+                # HYBRID disposition - direct Arrow results, use sync ArrowQueue
+                arrow_file = (
+                    ResultSetDownloadHandler._decompress_data(result_data.attachment)
+                    if execute_response.lz4_compressed
+                    else result_data.attachment
+                )
+                arrow_table = create_arrow_table_from_arrow_file(
+                    arrow_file, execute_response.description
+                )
+                results_queue = ArrowQueue(arrow_table, manifest.total_row_count)
+            else:
+                # EXTERNAL_LINKS disposition - use async cloud fetch queue
+                self._async_cloud_fetch_queue = AsyncSeaCloudFetchQueue(
+                    result_data=result_data,
+                    max_download_threads=sea_client.max_download_threads,
+                    ssl_options=ssl_options,
+                    sea_client=sea_client,
+                    statement_id=statement_id,
+                    total_chunk_count=manifest.total_chunk_count,
+                    lz4_compressed=execute_response.lz4_compressed,
+                    description=execute_response.description,
+                )
 
         # Call parent constructor with common attributes
         super().__init__(
@@ -175,8 +192,13 @@ class AsyncSeaResultSet(AsyncResultSet):
         if size < 0:
             raise ValueError(f"size argument for fetchmany is {size} but must be >= 0")
 
-        # Queue operations are synchronous, but we make this method async
-        # for API consistency and potential future async cloud fetch
+        # Use async cloud fetch queue if available
+        if self._async_cloud_fetch_queue is not None:
+            results = await self._async_cloud_fetch_queue.next_n_rows(size)
+            self._next_row_index += results.num_rows
+            return results
+
+        # Otherwise use sync queue
         results = self.results.next_n_rows(size)
         if isinstance(self.results, JsonQueue):
             results = self._convert_json_to_arrow_table(results)
@@ -187,6 +209,13 @@ class AsyncSeaResultSet(AsyncResultSet):
 
     async def fetchall_arrow(self) -> "pyarrow.Table":
         """Fetch all remaining rows as an Arrow table asynchronously."""
+        # Use async cloud fetch queue if available
+        if self._async_cloud_fetch_queue is not None:
+            results = await self._async_cloud_fetch_queue.remaining_rows()
+            self._next_row_index += results.num_rows
+            return results
+
+        # Otherwise use sync queue
         results = self.results.remaining_rows()
         if isinstance(self.results, JsonQueue):
             results = self._convert_json_to_arrow_table(results)
@@ -202,7 +231,10 @@ class AsyncSeaResultSet(AsyncResultSet):
         Returns:
             A single Row object or None if no more rows are available
         """
-        if isinstance(self.results, JsonQueue):
+        if self._async_cloud_fetch_queue is not None:
+            table = await self.fetchmany_arrow(1)
+            res = self._convert_arrow_table(table)
+        elif isinstance(self.results, JsonQueue):
             rows = self._fetchmany_json_sync(1)
             res = self._create_json_table(rows)
         else:
@@ -221,7 +253,10 @@ class AsyncSeaResultSet(AsyncResultSet):
         Returns:
             List of Row objects
         """
-        if isinstance(self.results, JsonQueue):
+        if self._async_cloud_fetch_queue is not None:
+            table = await self.fetchmany_arrow(size)
+            return self._convert_arrow_table(table)
+        elif isinstance(self.results, JsonQueue):
             rows = self._fetchmany_json_sync(size)
             return self._create_json_table(rows)
         else:
@@ -235,9 +270,21 @@ class AsyncSeaResultSet(AsyncResultSet):
         Returns:
             List of Row objects containing all remaining rows
         """
-        if isinstance(self.results, JsonQueue):
+        if self._async_cloud_fetch_queue is not None:
+            table = await self.fetchall_arrow()
+            return self._convert_arrow_table(table)
+        elif isinstance(self.results, JsonQueue):
             rows = self._fetchall_json_sync()
             return self._create_json_table(rows)
         else:
             table = await self.fetchall_arrow()
             return self._convert_arrow_table(table)
+
+    async def close(self) -> None:
+        """Close the result set and release resources."""
+        # Close async cloud fetch queue if present
+        if self._async_cloud_fetch_queue is not None:
+            await self._async_cloud_fetch_queue.close()
+
+        # Call parent close
+        await super().close()
